@@ -20,6 +20,7 @@ from django.utils import six
 from django.utils import timezone
 
 from .. import proquint
+from ..constants import transfer_status
 from ..registry import syncable_models
 from .certificates import Certificate
 from .certificates import Filter
@@ -258,6 +259,9 @@ class TransferSession(models.Model):
     client_fsic = models.TextField(blank=True, default="{}")
     server_fsic = models.TextField(blank=True, default="{}")
 
+    # stages of transfer session
+    transfer_stage = models.CharField(max_length=20, choices=transfer_status.choices, blank=True)
+
     def get_filter(self):
         return Filter(self.filter)
 
@@ -407,6 +411,7 @@ class Store(AbstractStore):
 
                 # if we got here, it means the validation error wasn't handled by propagating deletion, so re-raise it
                 raise e
+
 
 
 class Buffer(AbstractStore):
