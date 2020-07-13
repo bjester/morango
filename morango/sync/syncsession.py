@@ -8,7 +8,6 @@ from django.conf import settings
 from django.core.paginator import Paginator
 from django.utils import timezone
 from django.utils.six import iteritems
-from requests.adapters import HTTPAdapter
 from requests.exceptions import Timeout
 from requests.packages.urllib3.util.retry import Retry
 from rest_framework.exceptions import ValidationError
@@ -38,6 +37,8 @@ from morango.models.core import InstanceIDModel
 from morango.models.core import RecordMaxCounterBuffer
 from morango.models.core import SyncSession
 from morango.models.core import TransferSession
+from morango.sync.session import HTTPAdapterWrapper
+from morango.sync.session import SyncSignal
 from morango.utils import CAPABILITIES
 
 if GZIP_BUFFER_POST in CAPABILITIES:
@@ -104,7 +105,7 @@ class NetworkSyncConnection(Connection):
         # sleep for {backoff factor} * (2 ^ ({number of total retries} - 1)) between requests
         # with 7 retry attempts, sleep escalation becomes (0.6s, 1.2s, ..., 38.4s)
         retry = Retry(total=retries, backoff_factor=backoff_factor)
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = HTTPAdapterWrapper(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         # get morango information about server
@@ -436,37 +437,6 @@ class NetworkSyncConnection(Connection):
             "transfer_session_id": transfer_session.id,
         }
         return self.session.get(self.urlresolve(api_urls.BUFFER), params=params)
-
-
-class SyncSignal(object):
-    """
-    Helper class for firing signals from the sync client
-    """
-
-    def __init__(self, **kwargs_defaults):
-        """
-        Default keys/values that the signal consumer can depend on being present.
-        """
-        self._handlers = []
-        self._defaults = kwargs_defaults
-
-    def connect(self, handler):
-        """
-        Adds a callable handler that will be called when the signal is fired.
-
-        :type handler: function
-        """
-        self._handlers.append(handler)
-
-    def fire(self, **kwargs):
-        """
-        Fires the handler functions connected via `connect`.
-        """
-        fire_kwargs = self._defaults.copy()
-        fire_kwargs.update(kwargs)
-
-        for handler in self._handlers:
-            handler(**fire_kwargs)
 
 
 class SyncSignalGroup(SyncSignal):
