@@ -104,12 +104,7 @@ class QueueStoreIntoBufferTestCase(TestCase):
         self.assertRecordsBuffered(self.data["group1_c2"])
         self.assertRecordsBuffered(self.data["group2_c1"])
 
-    @pytest.mark.skip("Takes 30+ seconds, manual run only")
     def test_very_very_many_fsics(self):
-        """
-        Regression test against 'Expression tree is too large (maximum depth 1000)' error with many fsics
-        Maximum supported value: 99,999
-        """
         fsics = {self.data["group1_id"].id: 1, self.data["group2_id"].id: 1}
         fsics.update({
             uuid.uuid4().hex: i
@@ -121,16 +116,6 @@ class QueueStoreIntoBufferTestCase(TestCase):
         self.assertRecordsBuffered(self.data["group1_c1"])
         self.assertRecordsBuffered(self.data["group1_c2"])
         self.assertRecordsBuffered(self.data["group2_c1"])
-
-    def test_too_many_fsics(self):
-        fsics = {self.data["group1_id"].id: 1, self.data["group2_id"].id: 1}
-        fsics.update({
-            uuid.uuid4().hex: i
-            for i in range(100000)
-        })
-        self.transfer_session.client_fsic = json.dumps(fsics)
-        with self.assertRaises(MorangoLimitExceeded):
-            _queue_into_buffer(self.transfer_session)
 
     def test_fsic_specific_id(self):
         fsics = {self.data["group2_id"].id: 1}

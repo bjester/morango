@@ -31,6 +31,7 @@ from morango.models.core import RecordMaxCounter
 from morango.models.core import RecordMaxCounterBuffer
 from morango.models.core import Store
 from morango.models.core import TransferSession
+from morango.models.core import TransferSessionCounter
 from morango.registry import syncable_models
 from morango.sync.backends.utils import load_backend
 from morango.sync.context import LocalSessionContext
@@ -416,97 +417,32 @@ def _queue_into_buffer(transfersession):
     We use raw sql queries to place data in the buffer and the record max counter buffer, which matches the conditions of the FSIC,
     as well as the partition for the data we are syncing.
     """
-    filter_prefixes = Filter(transfersession.filter)
-    server_fsic = json.loads(transfersession.server_fsic)
-    client_fsic = json.loads(transfersession.client_fsic)
-
-    if transfersession.push:
-        fsics = _fsic_queuing_calc(client_fsic, server_fsic)
-    else:
-        fsics = _fsic_queuing_calc(server_fsic, client_fsic)
-
     # if fsics are identical or receiving end has newer data, then there is nothing to queue
-    if not fsics:
+    if not transfersession.get_fsics_for_queuing().exists():
         return
 
-    profile_condition = ["profile = '{}'".format(transfersession.sync_session.profile)]
+    all_conditions = ["profile = %s"]
+    params = [transfersession.sync_session.profile]
+
+    filter_prefixes = Filter(transfersession.filter)
     partition_conditions = []
+
     # create condition for filtering by partitions
     for prefix in filter_prefixes:
-        partition_conditions += ["partition LIKE '{}%'".format(prefix)]
-    if filter_prefixes:
-        partition_conditions = [_join_with_logical_operator(partition_conditions, "OR")]
+        params.append("{}%".format(prefix))
+        partition_conditions.append("partition LIKE %s")
 
-    chunk_size = 200
-    fsics = list(fsics.items())
-    fsics_len = len(fsics)
-    fsics_limit = chunk_size * SQL_UNION_MAX
+    if partition_conditions:
+        all_conditions.append(_join_with_logical_operator(partition_conditions, "OR"))
 
-    if fsics_len >= fsics_limit:
-        raise MorangoLimitExceeded(
-            "Limit of {limit} instance counters exceeded with {actual}".format(
-                limit=fsics_limit, actual=fsics_len
-            )
-        )
+    store_condition = _join_with_logical_operator(all_conditions, "AND")
 
-    # chunk fsics creating multiple SQL selects which will be unioned before insert
-    i = 0
-    chunk = fsics[:chunk_size]
-    select_buffers = []
-    select_rmc_buffers = []
-
-    while chunk:
-        # create condition for all push FSICs where instance_ids are equal, but internal counters are higher than
-        # FSICs counters
-        last_saved_by_conditions = [
-            "(last_saved_instance = '{0}' AND last_saved_counter > {1})".format(
-                instance, counter
-            )
-            for instance, counter in chunk
-        ]
-        if last_saved_by_conditions:
-            last_saved_by_conditions = [
-                _join_with_logical_operator(last_saved_by_conditions, "OR")
-            ]
-
-        # combine conditions and filter by profile
-        where_condition = _join_with_logical_operator(
-            profile_condition + last_saved_by_conditions + partition_conditions, "AND"
-        )
-
-        # execute raw sql to take all records that match condition, to be put into buffer for transfer
-        select_buffers.append(
-            """SELECT
-                   id, serialized, deleted, last_saved_instance, last_saved_counter, hard_deleted, model_name, profile,
-                   partition, source_id, conflicting_serialized_data,
-                   CAST ('{transfer_session_id}' AS {transfer_session_id_type}), _self_ref_fk
-               FROM {store} WHERE {condition}
-            """.format(
-                transfer_session_id=transfersession.id,
-                transfer_session_id_type=TransferSession._meta.pk.rel_db_type(
-                    connection
-                ),
-                condition=where_condition,
-                store=Store._meta.db_table,
-            )
-        )
-        # take all record max counters that are foreign keyed onto store models, which were queued into the buffer
-        select_rmc_buffers.append(
-            """SELECT instance_id, counter, CAST ('{transfer_session_id}' AS {transfer_session_id_type}), store_model_id
-               FROM {record_max_counter} AS rmc
-               INNER JOIN {outgoing_buffer} AS buffer ON rmc.store_model_id = buffer.model_uuid
-               WHERE buffer.transfer_session_id = '{transfer_session_id}'
-            """.format(
-                transfer_session_id=transfersession.id,
-                transfer_session_id_type=TransferSession._meta.pk.rel_db_type(
-                    connection
-                ),
-                record_max_counter=RecordMaxCounter._meta.db_table,
-                outgoing_buffer=Buffer._meta.db_table,
-            )
-        )
-        i += chunk_size
-        chunk = fsics[i : i + chunk_size]
+    if transfersession.push:
+        counter_compare_field = "tsc.server_counter"
+        counter_condition = "tsc.server_counter < tsc.client_counter"
+    else:
+        counter_compare_field = "tsc.client_counter"
+        counter_condition = "tsc.client_counter < tsc.server_counter"
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -514,20 +450,49 @@ def _queue_into_buffer(transfersession):
                (model_uuid, serialized, deleted, last_saved_instance, last_saved_counter,
                hard_deleted, model_name, profile, partition, source_id, conflicting_serialized_data,
                transfer_session_id, _self_ref_fk)
-               {select}
+               SELECT
+                   id, serialized, deleted, last_saved_instance, last_saved_counter, hard_deleted, model_name, profile,
+                   partition, source_id, conflicting_serialized_data, %s, _self_ref_fk
+               FROM {store} AS s
+               WHERE {store_condition} AND EXISTS(
+                   SELECT 1
+                   FROM {transfer_session_counter} AS tsc
+                   WHERE {counter_condition}
+                       AND s.last_saved_instance = tsc.instance_id
+                       AND s.last_saved_counter > {counter_compare_field}
+               )
             """.format(
+                # tables
                 outgoing_buffer=Buffer._meta.db_table,
-                select=" UNION ".join(select_buffers),
-            )
+                store=Store._meta.db_table,
+                transfer_session_counter=TransferSessionCounter._meta.db_table,
+
+                # filters
+                store_condition=store_condition,
+                counter_condition=counter_condition,
+                counter_compare_field=counter_compare_field,
+            ),
+            [
+                transfersession.id,
+                *params,
+            ]
         )
         cursor.execute(
             """INSERT INTO {outgoing_rmcb}
                (instance_id, counter, transfer_session_id, model_uuid)
-               {select}
+               SELECT instance_id, counter, %s, store_model_id
+               FROM {record_max_counter} AS rmc
+               INNER JOIN {outgoing_buffer} AS buffer ON rmc.store_model_id = buffer.model_uuid
+               WHERE buffer.transfer_session_id = %s
             """.format(
                 outgoing_rmcb=RecordMaxCounterBuffer._meta.db_table,
-                select=" UNION ".join(select_rmc_buffers),
-            )
+                record_max_counter=RecordMaxCounter._meta.db_table,
+                outgoing_buffer=Buffer._meta.db_table,
+            ),
+            [
+                transfersession.id,
+                transfersession.id,
+            ]
         )
 
 
@@ -868,12 +833,14 @@ class ReceiverDeserializeOperation(LocalOperation):
 
         # update database max counters but use latest fsics from client/server
         if context.is_receiver:
-            fsic = (
-                context.transfer_session.client_fsic
+            context.transfer_session.load_fsics(do_save=True)
+            fsics = (
+                context.transfer_session.fsics.values_list("instance_id", "client_counter")
                 if context.is_server
-                else context.transfer_session.server_fsic
+                else context.transfer_session.fsics.values_list("instance_id", "server_counter")
             )
-            DatabaseMaxCounter.update_fsics(json.loads(fsic), context.filter)
+            print("XXX", dict(fsics))
+            DatabaseMaxCounter.update_fsics(dict(fsics), context.filter)
 
         return transfer_statuses.COMPLETED
 

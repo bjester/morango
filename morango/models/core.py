@@ -306,6 +306,61 @@ class TransferSession(models.Model):
             self.sync_session.last_activity_timestamp = timezone.now()
             self.sync_session.save()
 
+    def load_fsics(self, do_save=False):
+        server_fsic = json.loads(self.server_fsic)
+        client_fsic = json.loads(self.client_fsic)
+        all_instance_ids = set(list(server_fsic.keys()) + list(client_fsic.keys()))
+
+        # nothing to do
+        if not all_instance_ids:
+            return
+
+        counters = []
+        for instance_id in all_instance_ids:
+            counter = dict(
+                transfer_session_id=self.id,
+                instance_id=instance_id,
+            )
+            # conditionally add these fields to prevent update_or_create from overwriting with default 0's allowing
+            # database defaults to handle that
+            if server_fsic.get(instance_id):
+                counter.update(server_counter=server_fsic.get(instance_id))
+            if client_fsic.get(instance_id):
+                counter.update(client_counter=client_fsic.get(instance_id))
+            counters.append(counter)
+
+        # within the same transaction, create the records and reset the transfer session fsic fields
+        with transaction.atomic():
+            if not self.fsics.exists():
+                TransferSessionCounter.objects.bulk_create(
+                    [TransferSessionCounter(**c) for c in counters],
+                    batch_size=200
+                )
+            else:
+                for counter in counters:
+                    TransferSessionCounter.objects.update_or_create(
+                        transfer_session_id=self.id,
+                        instance_id=counter.get("instance_id"),
+                        defaults=counter,
+                    )
+            self.server_fsic = "{}"
+            self.client_fsic = "{}"
+            if do_save:
+                self.save()
+
+    def get_fsics_for_queuing(self):
+        """
+        :return: Queryset
+        """
+        self.load_fsics(do_save=True)
+
+        if self.push:
+            counter_filter = {"server_counter__lt": F("client_counter")}
+        else:
+            counter_filter = {"client_counter__lt": F("server_counter")}
+
+        return self.fsics.filter(**counter_filter)
+
     def delete_buffers(self):
         """
         Deletes `Buffer` and `RecordMaxCounterBuffer` model records by executing SQL directly
@@ -329,6 +384,21 @@ class TransferSession(models.Model):
         return Store.objects.filter(
             model_name=model, last_transfer_session_id=self.id
         ).values_list("id", flat=True)
+
+
+class TransferSessionCounter(models.Model):
+    """
+    Tracks the database instance counters for a TransferSession between client and server
+    """
+    transfer_session = models.ForeignKey(TransferSession, related_name="fsics", db_index=True, on_delete=models.CASCADE)
+    # the UUID of the morango instance for which we're tracking the counter
+    instance_id = UUIDField()
+    # the counter of the morango instance at the time of serialization or merge conflict resolution
+    server_counter = models.IntegerField(default=0)
+    client_counter = models.IntegerField(default=0)
+
+    class Meta:
+        unique_together = ("transfer_session", "instance_id")
 
 
 class DeletedModels(models.Model):
@@ -547,6 +617,7 @@ class DatabaseMaxCounter(AbstractCounter):
     """
 
     partition = models.CharField(max_length=128, default="")
+    last_updated = models.DateTimeField(null=True, default=None, blank=True)
 
     class Meta:
         unique_together = ("instance_id", "partition")
@@ -571,7 +642,10 @@ class DatabaseMaxCounter(AbstractCounter):
         for (key, value) in six.iteritems(updated_fsic):
             for f in sync_filter:
                 DatabaseMaxCounter.objects.update_or_create(
-                    instance_id=key, partition=f, defaults={"counter": value}
+                    instance_id=key, partition=f, defaults={
+                        "counter": value,
+                        "last_updated": timezone.now(),
+                    }
                 )
 
     @classmethod
