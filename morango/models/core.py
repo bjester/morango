@@ -5,6 +5,10 @@ import json
 import logging
 import uuid
 
+from functools import reduce
+from collections import namedtuple
+from collections import defaultdict
+
 from django.core import exceptions
 from django.db import connection
 from django.db import models
@@ -23,8 +27,6 @@ from django.db.models.functions import Cast
 from django.utils import six
 from django.utils import timezone
 from django.utils.functional import cached_property
-
-from functools import reduce
 
 from morango import proquint
 from morango.errors import InvalidMorangoSourceId
@@ -446,15 +448,16 @@ class Store(AbstractStore):
 
     objects = StoreManager()
 
-    def _deserialize_store_model(self, fk_cache):  # noqa: C901
+    def _deserialize_store_model(self, fk_cache, defer_fks=False):  # noqa: C901
         """
         When deserializing a store model, we look at the deleted flags to know if we should delete the app model.
         Upon loading the app model in memory we validate the app models fields, if any errors occurs we follow
         foreign key relationships to see if the related model has been deleted to propagate that deletion to the target app model.
         We return:
-        None => if the model was deleted successfully
-        model => if the model validates successfully
+            None => if the model was deleted successfully
+            model => if the model validates successfully
         """
+        deferred_fks = {}
         klass_model = syncable_models.get_model(self.profile, self.model_name)
         # if store model marked as deleted, attempt to delete in app layer
         if self.deleted:
@@ -466,7 +469,7 @@ class Store(AbstractStore):
                     pass
             else:
                 klass_model.objects.filter(id=self.id).delete()
-            return None
+            return None, deferred_fks
         else:
             # load model into memory
             app_model = klass_model.deserialize(json.loads(self.serialized))
@@ -475,10 +478,12 @@ class Store(AbstractStore):
             app_model._morango_dirty_bit = False
 
             try:
-
                 # validate and return the model
-                app_model.cached_clean_fields(fk_cache)
-                return app_model
+                if defer_fks:
+                    deferred_fks = app_model.deferred_clean_fields()
+                else:
+                    app_model.cached_clean_fields(fk_cache)
+                return app_model, deferred_fks
 
             except (exceptions.ValidationError, exceptions.ObjectDoesNotExist) as e:
 
@@ -488,23 +493,24 @@ class Store(AbstractStore):
                     )
                 )
 
-                # check FKs in store to see if any of those models were deleted or hard_deleted to propagate to this model
-                fk_ids = [
-                    getattr(app_model, field.attname)
-                    for field in app_model._meta.fields
-                    if isinstance(field, ForeignKey)
-                ]
-                for fk_id in fk_ids:
-                    try:
-                        st_model = Store.objects.get(id=fk_id)
-                        if st_model.deleted:
-                            # if hard deleted, propagate to store model
-                            if st_model.hard_deleted:
-                                app_model._update_hard_deleted_models()
-                            app_model._update_deleted_models()
-                            return None
-                    except Store.DoesNotExist:
-                        pass
+                if not defer_fks and isinstance(e, exceptions.ObjectDoesNotExist):
+                    # check FKs in store to see if any of those models were deleted or hard_deleted to propagate to this model
+                    fk_ids = [
+                        getattr(app_model, field.attname)
+                        for field in app_model._meta.fields
+                        if isinstance(field, ForeignKey)
+                    ]
+                    for fk_id in fk_ids:
+                        try:
+                            st_model = Store.objects.get(id=fk_id)
+                            if st_model.deleted:
+                                # if hard deleted, propagate to store model
+                                if st_model.hard_deleted:
+                                    app_model._update_hard_deleted_models()
+                                app_model._update_deleted_models()
+                                return None, {}
+                        except Store.DoesNotExist:
+                            pass
 
                 # if we got here, it means the validation error wasn't handled by propagating deletion, so re-raise it
                 raise e
@@ -767,6 +773,9 @@ class RecordMaxCounterBuffer(AbstractCounter):
     model_uuid = UUIDField(db_index=True)
 
 
+ForeignKeyReference = namedtuple("ForeignKeyReference", ["from_pk", "to_pk"])
+
+
 class SyncableModel(UUIDModelMixin):
     """
     ``SyncableModel`` is the base model class for syncing. Other models inherit from this class if they want to make
@@ -839,9 +848,10 @@ class SyncableModel(UUIDModelMixin):
         fk_fields = [
             field for field in self._meta.fields if isinstance(field, models.ForeignKey)
         ]
+
         for f in fk_fields:
             raw_value = getattr(self, f.attname)
-            key = "morango_{id}_{db_table}_foreignkey".format(
+            key = "{id}_{db_table}".format(
                 db_table=f.related_model._meta.db_table, id=raw_value
             )
             try:
@@ -855,7 +865,35 @@ class SyncableModel(UUIDModelMixin):
                 else:
                     fk_lookup_cache[key] = 1
                     excluded_fields.append(f.name)
+
         self.clean_fields(exclude=excluded_fields)
+
+        # after cleaning, we can confidently set ourselves in the fk_lookup_cache
+        self_key = "{id}_{db_table}".format(
+            db_table=self._meta.db_table,
+            id=self.id,
+        )
+        fk_lookup_cache[self_key] = 1
+
+    def deferred_clean_fields(self):
+        """
+        Calls `.clean_fields()` but excludes all foreign key fields and instead adds them to the
+        `fk_references` dictionary for deferred batch processing
+
+        :param fk_references: A dictionary passed by reference
+        """
+        excluded_fields = []
+        deferred_fks = defaultdict(list)
+        for field in self._meta.fields:
+            if not isinstance(field, models.ForeignKey):
+                continue
+            excluded_fields.append(field.name)
+            deferred_fks[field.related_model.__name__].append(
+                ForeignKeyReference(from_pk=self.pk, to_pk=getattr(self, field.attname))
+            )
+
+        self.clean_fields(exclude=excluded_fields)
+        return deferred_fks
 
     def serialize(self):
         """All concrete fields of the ``SyncableModel`` subclass, except for those specifically blacklisted, are returned in a dict."""
