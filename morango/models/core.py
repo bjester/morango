@@ -4,10 +4,9 @@ import functools
 import json
 import logging
 import uuid
-
-from functools import reduce
-from collections import namedtuple
 from collections import defaultdict
+from collections import namedtuple
+from functools import reduce
 
 from django.core import exceptions
 from django.db import connection
@@ -29,8 +28,9 @@ from django.utils import timezone
 from django.utils.functional import cached_property
 
 from morango import proquint
+from morango.constants import transfer_stages
+from morango.constants import transfer_statuses
 from morango.errors import InvalidMorangoSourceId
-from morango.registry import syncable_models
 from morango.models.certificates import Certificate
 from morango.models.certificates import Filter
 from morango.models.fields.uuids import sha2_uuid
@@ -40,10 +40,9 @@ from morango.models.fsic_utils import remove_redundant_instance_counters
 from morango.models.manager import SyncableModelManager
 from morango.models.morango_mptt import MorangoMPTTModel
 from morango.models.utils import get_0_4_system_parameters
-from morango.models.utils import get_0_5_system_id
 from morango.models.utils import get_0_5_mac_address
-from morango.constants import transfer_stages
-from morango.constants import transfer_statuses
+from morango.models.utils import get_0_5_system_id
+from morango.registry import syncable_models
 from morango.utils import _assert
 from morango.utils import SETTINGS
 
@@ -844,6 +843,13 @@ class SyncableModel(UUIDModelMixin):
             return collector.delete()
 
     def cached_clean_fields(self, fk_lookup_cache):
+        """
+        Immediately validates all fields, but uses a cache for foreign key (FK) lookups to reduce
+        repeated queries for many records with the same FK
+
+        :param fk_lookup_cache: A dictionary to use as a cache to prevent querying the database if a
+            FK exists in the cache, having already been validated
+        """
         excluded_fields = []
         fk_fields = [
             field for field in self._meta.fields if isinstance(field, models.ForeignKey)
@@ -877,10 +883,11 @@ class SyncableModel(UUIDModelMixin):
 
     def deferred_clean_fields(self):
         """
-        Calls `.clean_fields()` but excludes all foreign key fields and instead adds them to the
-        `fk_references` dictionary for deferred batch processing
+        Calls `.clean_fields()` but excludes all foreign key fields and instead returns them as a
+        dictionary for deferred batch processing
 
-        :param fk_references: A dictionary passed by reference
+        :return: A dictionary containing lists of `ForeignKeyReference`s keyed by the name of the
+            model being referenced by the FK
         """
         excluded_fields = []
         deferred_fks = defaultdict(list)
