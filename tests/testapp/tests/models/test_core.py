@@ -3,17 +3,20 @@ import uuid
 import factory
 import mock
 from django.core.exceptions import ValidationError
+from django.core.serializers.json import DjangoJSONEncoder
 from django.test import override_settings
 from django.test import TestCase
 from django.utils import timezone
 from facility_profile.models import Facility
 from facility_profile.models import MyUser
+from facility_profile.models import SummaryLog
 
 from morango.constants import transfer_stages
 from morango.constants import transfer_statuses
 from morango.models.certificates import Filter
 from morango.models.core import Buffer
 from morango.models.core import DatabaseMaxCounter
+from morango.models.core import DeletedModels
 from morango.models.core import Store
 from morango.models.core import SyncSession
 from morango.models.core import TransferSession
@@ -607,3 +610,82 @@ class StoreQuerysetDeserializationErrorTestCase(TestCase):
 
         queryset = Store.objects.filter(id=self.empty.id).filter_has_deserialization_error()
         self.assertEqual(list(queryset), [])
+
+
+class StoreDeserializeStoreModelTestCase(TestCase):
+    """Tests for Store._deserialize_store_model(), which deserializes a single record by hand"""
+
+    def _store(self, app_model, **kwargs):
+        store_kwargs = dict(
+            id=app_model.id,
+            profile="facilitydata",
+            model_name=app_model.morango_model_name,
+            partition=app_model.id,
+            source_id=uuid.uuid4().hex,
+            serialized=DjangoJSONEncoder().encode(app_model.serialize()),
+            last_saved_instance=uuid.uuid4().hex,
+            last_saved_counter=1,
+            dirty_bit=True,
+        )
+        store_kwargs.update(kwargs)
+        return StoreFactory(**store_kwargs)
+
+    def _user(self, username="user", **kwargs):
+        user = MyUser(id=uuid.uuid4().hex, username=username, password="password")
+        return self._store(user, **kwargs)
+
+    def test_valid(self):
+        store = self._user()
+
+        app_model, deferred_fks = store._deserialize_store_model({})
+
+        self.assertEqual(deferred_fks, {})
+        self.assertIsInstance(app_model, MyUser)
+        self.assertEqual(app_model.username, "user")
+        self.assertFalse(MyUser.objects.exists())
+        self.assertTrue(Store.objects.get(id=store.id).dirty_bit)
+
+    def test_deleted(self):
+        user = MyUser(username="user", password="password")
+        user.save(update_dirty_bit_to=False)
+        store = self._store(user, deleted=True)
+
+        self.assertEqual(store._deserialize_store_model({}), (None, {}))
+        self.assertFalse(MyUser.objects.exists())
+
+    def test_target_deleted(self):
+        user = self._user(dirty_bit=False, deleted=True)
+        store = self._store(SummaryLog(id=uuid.uuid4().hex, user_id=user.id))
+
+        self.assertEqual(store._deserialize_store_model({}), (None, {}))
+        self.assertTrue(DeletedModels.objects.filter(id=store.id).exists())
+        self.assertTrue(Store.objects.get(id=store.id).dirty_bit)
+
+    def test_invalid(self):
+        store = self._user(username="x" * 256)
+
+        with self.assertLogs("morango.sync.stream.deserialize", "WARNING") as logs:
+            with self.assertRaises(ValidationError):
+                store._deserialize_store_model({})
+
+        self.assertIn(store.id, logs.output[0])
+
+    def test_defer_fks(self):
+        store = self._user()
+
+        with self.assertWarns(DeprecationWarning):
+            app_model, deferred_fks = store._deserialize_store_model({}, defer_fks=True)
+
+        self.assertEqual(app_model.id, store.id)
+        self.assertEqual(deferred_fks, {})
+
+    def test_fk_cache(self):
+        """The user is validated but never saved, so the log only validates through the cache"""
+        fk_cache = {}
+        user = self._user()
+        log = self._store(SummaryLog(id=uuid.uuid4().hex, user_id=user.id))
+
+        user._deserialize_store_model(fk_cache)
+        app_model, _ = log._deserialize_store_model(fk_cache)
+
+        self.assertEqual(app_model.id, log.id)

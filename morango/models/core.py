@@ -2,6 +2,7 @@ import functools
 import json
 import logging
 import uuid
+import warnings
 from collections import defaultdict
 from collections import namedtuple
 from functools import reduce
@@ -16,12 +17,10 @@ from django.db.models import F
 from django.db.models import Func
 from django.db.models import Max
 from django.db.models import Q
-from django.db.models import signals
 from django.db.models import TextField
 from django.db.models import Value
 from django.db.models.deletion import Collector
 from django.db.models.expressions import CombinedExpression
-from django.db.models.fields.related import ForeignKey
 from django.db.models.functions import Cast
 from django.db.models.functions import NullIf
 from django.utils import timezone
@@ -41,7 +40,6 @@ from morango.models.manager import SyncableModelManager
 from morango.models.utils import get_0_4_system_parameters
 from morango.models.utils import get_0_5_mac_address
 from morango.models.utils import get_0_5_system_id
-from morango.registry import syncable_models
 from morango.utils import _assert
 from morango.utils import exception_path
 from morango.utils import SETTINGS
@@ -501,81 +499,33 @@ class Store(AbstractStore):
         self.deserialization_error = None
         self.deserialization_exception = None
 
-    def _deserialize_store_model(self, fk_cache, defer_fks=False, sync_filter=None):  # noqa: C901
+    def _deserialize_store_model(self, fk_cache, defer_fks=False, sync_filter=None):
         """
-        When deserializing a store model, we look at the deleted flags to know if we should delete the app model.
-        Upon loading the app model in memory we validate the app models fields, if any errors occurs we follow
-        foreign key relationships to see if the related model has been deleted to propagate that deletion to the target app model.
-        We return:
-            None => if the model was deleted successfully
-            model => if the model validates successfully
+        Deserializes and validates this store record into its app model, without saving either.
 
-        :param fk_cache: A cache for foreign key lookups
+        A deleted record deletes its app model. A record that references a deleted record is
+        tracked as deleted in `DeletedModels`, and in `HardDeletedModels` for a hard deletion. A
+        record that fails is logged, and its error is raised.
+
+        We return:
+            (None, {}) => if the record was deleted, or its deletion propagated
+            (model, {}) => if the model validates successfully
+
+        :param fk_cache: A cache for foreign key lookups, shared across calls
         :type fk_cache: dict
-        :param defer_fks: Whether to defer foreign key lookups
+        :param defer_fks: No longer supported and ignored
         :type defer_fks: bool
         :param sync_filter: The current sync's filter, if any
         :type sync_filter: Filter|None
         """
-        deferred_fks = {}
-        klass_model = syncable_models.get_model(self.profile, self.model_name)
-        # if store model marked as deleted, attempt to delete in app layer
-        if self.deleted:
-            # Don't differentiate between deletion and hard deletion here,
-            # as we don't want to add additional tracking for models in either case,
-            # just to actually delete them.
-            # Import here to avoid circular import, as the utils module
-            # imports core models.
-            from morango.sync.utils import mute_signals
+        # Import here to avoid circular import, as the deserialize module imports core models.
+        from morango.sync.stream.deserialize import deserialize_store_model
 
-            with mute_signals(signals.post_delete):
-                klass_model.syncing_objects.filter(id=self.id).delete()
-            return None, deferred_fks
-        else:
-            # load model into memory
-            app_model = klass_model.deserialize(
-                json.loads(self.serialized), sync_filter=sync_filter
+        if defer_fks:
+            warnings.warn(
+                "defer_fks is no longer supported and is ignored", DeprecationWarning, stacklevel=2
             )
-            app_model._morango_source_id = self.source_id
-            app_model._morango_partition = self.partition
-            app_model._morango_dirty_bit = False
-
-            try:
-                # validate and return the model
-                if defer_fks:
-                    deferred_fks = app_model.deferred_clean_fields(sync_filter=sync_filter)
-                else:
-                    app_model.cached_clean_fields(fk_cache, sync_filter=sync_filter)
-                return app_model, deferred_fks
-
-            except (exceptions.ValidationError, exceptions.ObjectDoesNotExist) as e:
-                logger.warning(
-                    "Error deserializing instance of {model} with id {id}: {error}".format(
-                        model=klass_model.__name__, id=app_model.id, error=e
-                    )
-                )
-
-                if not defer_fks and isinstance(e, exceptions.ObjectDoesNotExist):
-                    # check FKs in store to see if any of those models were deleted or hard_deleted to propagate to this model
-                    fk_ids = [
-                        getattr(app_model, field.attname)
-                        for field in app_model._meta.fields
-                        if isinstance(field, ForeignKey)
-                    ]
-                    for fk_id in fk_ids:
-                        try:
-                            st_model = Store.objects.get(id=fk_id)
-                            if st_model.deleted:
-                                # if hard deleted, propagate to store model
-                                if st_model.hard_deleted:
-                                    app_model._update_hard_deleted_models()
-                                app_model._update_deleted_models()
-                                return None, {}
-                        except Store.DoesNotExist:
-                            pass
-
-                # if we got here, it means the validation error wasn't handled by propagating deletion, so re-raise it
-                raise e
+        return deserialize_store_model(self, fk_cache, sync_filter=sync_filter), {}
 
 
 class Buffer(AbstractStore):
